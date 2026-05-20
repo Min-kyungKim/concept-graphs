@@ -1,0 +1,30 @@
+#!/bin/bash
+# Example script setting up the rnv variables needed for running ConceptGraphs
+# Please adapt it to your own paths!
+
+export CG_FOLDER=/home/guest/research/concept-graphs/
+
+export GSA_PATH=/home/guest/research/Grounded-Segment-Anything
+
+export REPLICA_ROOT=/home/guest/research/Datasets/Replica
+export REPLICA_CONFIG_PATH=${CG_FOLDER}/conceptgraph/dataset/dataconfigs/replica/replica.yaml
+
+# export OPENAI_API_KEY=<your GPT-4 API KEY here>
+
+export LLAVA_PYTHON_PATH=/home/guest/research/LLaVA
+export LLAVA_CKPT_PATH=/home/guest/research/models/LLaVA-7B-v0
+
+export REPLICA_SEMANTIC_ROOT=/home/guest/research/Datasets/Replica_semantic
+
+export CUDA_HOME=$CONDA_PREFIX
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib:$LD_LIBRARY_PATH
+
+export CC=$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-gcc
+export CXX=$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++
+
+export GEMINI_API_KEY="AIzaSyD6m1tL1rvSI9cBArc48q3ByqwWWLeJE9c"
+export LITELLM_DISABLE_TELEMETRY=True
+
+export CONTEXTBOT_ROOT=/home/guest/research/Datasets/CONTEXT-BOT/CONTEXT-BOT
+export CONTEXTBOT_CONFIG_PATH=${CG_FOLDER}/conceptgraph/dataset/dataconfigs/contextbot.yaml

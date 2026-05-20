@@ -1,0 +1,14 @@
+dataset_name: 'pado'
+camera_params:
+  image_height: 1440
+  image_width: 1920
+  # image_height: 1920
+  # image_width: 1440
+  fx: 1592
+  fy: 1592
+  cx: 952
+  cy: 742
+  # cx: 742
+  # cy: 952
+  png_depth_scale: 1000 #for depth image in png format
+  crop_edge: 0

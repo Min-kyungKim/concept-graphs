@@ -2,6 +2,7 @@
 Build a scene graph from the segment-based map and captions from LLaVA.
 """
 
+import csv
 import gc
 import gzip
 import json
@@ -45,7 +46,10 @@ hf_logging.set_verbosity_error()
 # Import OpenAI API
 import openai
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
+client = openai.OpenAI(
+    api_key="anything",
+    base_url="http://127.0.0.1:4000"
+)
 
 
 @dataclass
@@ -83,6 +87,42 @@ class ProgramArgs:
 
     # Masking option
     masking_option: Literal["blackout", "red_outline", "none"] = "none"
+
+    relevance_csv: Union[str, None] = None
+
+    top_k: Union[int, None] = None
+
+def load_topk_from_csv(relevance_csv: str, top_k: int):
+    """
+    task_relevance_scoring.py 가 저장한 CSV를 읽어 top-k 인덱스를 반환.
+ 
+    CSV는 relevance_score 내림차순으로 정렬되어 있으므로
+    상위 top_k 행 = 상위 top_k 객체.
+ 
+    CSV 컬럼: rank, object_idx, relevance_score, best_task_idx, best_task,
+              num_detections, n_points, class_name
+ 
+    Returns:
+        topk_indices  (list[int]): 원본 scene_map 인덱스, score 내림차순
+        full_scores   (dict[int, float]): object_idx -> relevance_score (전체)
+    """
+    topk_indices: List[int] = []
+    full_scores: Dict[int, float] = {}
+ 
+    with open(relevance_csv, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            idx = int(row["object_idx"])
+            score = float(row["relevance_score"])
+            full_scores[idx] = score
+            if len(topk_indices) < top_k:
+                topk_indices.append(idx)   # CSV가 내림차순이므로 순서대로 추가
+ 
+    print(f"[TopK Pruning] CSV 로드: {relevance_csv}")
+    print(f"[TopK Pruning] 전체 {len(full_scores)}개 중 상위 {len(topk_indices)}개 선택")
+    print(f"[TopK Pruning] 중심 노드 (argmax): obj_{topk_indices[0]}, "
+          f"score={full_scores[topk_indices[0]]:.4f}")
+    return topk_indices, full_scores
 
 def load_scene_map(args, scene_map):
     """
@@ -256,6 +296,17 @@ def extract_node_captions(args):
     # 'mask', 'xyxy', 'conf', 'n_points', 'pixel_area', 'contain_number', 'clip_ft',
     # 'text_ft', 'pcd_np', 'bbox_np', 'pcd_color_np'
 
+    if args.relevance_csv is not None:
+        topk_indices, _ = load_topk_from_csv(args.relevance_csv, args.top_k)
+        # scene_map 순서를 유지하기 위해 오름차순 정렬
+        topk_indices_sorted = sorted(topk_indices)
+        scene_map = MapObjectList([scene_map[i] for i in topk_indices_sorted])
+        orig_indices = topk_indices_sorted
+        print(f"[TopK Pruning] {len(orig_indices)}개 객체에 대해 LLaVA captioning 수행")
+    else:
+        # relevance_csv 미지정 시 원본 동작 그대로
+        orig_indices = list(range(len(scene_map)))
+
     # Imports to help with feature extraction
     # from extract_mask_level_features import (
     #     crop_bbox_from_img,
@@ -290,6 +341,8 @@ def extract_node_captions(args):
     caption_dict_list = []
 
     for idx_obj, obj in tqdm(enumerate(scene_map), total=len(scene_map)):
+        orig_id = orig_indices[idx_obj]
+
         conf = obj["conf"]
         conf = np.array(conf)
         idx_most_conf = np.argsort(conf)[::-1]
@@ -360,7 +413,7 @@ def extract_node_captions(args):
 
         caption_dict_list.append(
             {
-                "id": idx_obj,
+                "id": orig_id,
                 "captions": captions,
                 "low_confidences": low_confidences,
             }
@@ -371,7 +424,7 @@ def extract_node_captions(args):
             features = torch.cat(features, dim=0)
 
         # Save the feature descriptors
-        torch.save(features, savedir_feat / f"{idx_obj}.pt")
+        torch.save(features, savedir_feat / f"{orig_id}.pt")
         
         # Again for the LLava debug folder
         if len(image_list) > 0:
@@ -411,6 +464,13 @@ def refine_node_captions(args):
     # Load the scene map
     scene_map = MapObjectList()
     load_scene_map(args, scene_map)
+
+    if args.relevance_csv is not None:
+        topk_indices, _ = load_topk_from_csv(args.relevance_csv, args.top_k)
+        topk_set = set(topk_indices)
+        # captions의 id가 원본 scene_map 인덱스이므로 topk_set으로 필터링
+        captions = [c for c in captions if c["id"] in topk_set]
+        print(f"[TopK Pruning] {len(captions)}개 객체에 대해 GPT-4 refinement 수행")
     
     # load the prompt
     gpt_messages = GPTPrompt().get_json()
@@ -431,7 +491,8 @@ def refine_node_captions(args):
         # Prepare the object prompt 
         _dict = {}
         _caption = captions[_i]
-        _bbox = scene_map[_i]["bbox"]
+        orig_id = _caption["id"]
+        _bbox = scene_map[orig_id]["bbox"]
         # _bbox = o3d.geometry.OrientedBoundingBox.create_from_points(o3d.utility.Vector3dVector(scene_map[_i]["bbox"]))
         _dict["id"] = _caption["id"]
         # _dict["bbox_extent"] = np.round(_bbox.extent, 1).tolist()
@@ -447,9 +508,9 @@ def refine_node_captions(args):
     
         curr_chat_messages = gpt_messages[:]
         curr_chat_messages.append({"role": "user", "content": preds})
-        chat_completion = openai.ChatCompletion.create(
+        chat_completion = client.chat.completions.create(
             # model="gpt-3.5-turbo",
-            model="gpt-4",
+            model="gemini/gemini-3.1-flash-lite-preview",
             messages=curr_chat_messages,
             timeout=TIMEOUT,  # Timeout in seconds
         )
@@ -458,24 +519,24 @@ def refine_node_captions(args):
             print("Timed out exceeded!")
             _dict["response"] = "FAIL"
             # responses.append('{"object_tag": "FAIL"}')
-            save_json_to_file(_dict, responses_savedir / f"{_caption['id']}.json")
+            save_json_to_file(_dict, responses_savedir / f"{orig_id}.json")
             responses.append(json.dumps(_dict))
             unsucessful_responses += 1
             continue
         
         # count unsucessful responses
-        if "invalid" in chat_completion["choices"][0]["message"]["content"].strip("\n"):
+        if "invalid" in chat_completion.choices[0].message.content.strip("\n"):
             unsucessful_responses += 1
             
         # print output
         prjson([{"role": "user", "content": preds}])
-        print(chat_completion["choices"][0]["message"]["content"])
+        print(chat_completion.choices[0].message.content)
         print(f"Unsucessful responses so far: {unsucessful_responses}")
-        _dict["response"] = chat_completion["choices"][0]["message"]["content"].strip("\n")
+        _dict["response"] = chat_completion.choices[0].message.content.strip("\n")
         
         # save the response
         responses.append(json.dumps(_dict))
-        save_json_to_file(_dict, responses_savedir / f"{_caption['id']}.json")
+        save_json_to_file(_dict, responses_savedir / f"{orig_id}.json")
         # responses.append(chat_completion["choices"][0]["message"]["content"].strip("\n"))
 
     # tags = []

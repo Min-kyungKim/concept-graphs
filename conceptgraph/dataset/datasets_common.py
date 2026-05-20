@@ -29,6 +29,34 @@ from gradslam.slam.pointfusion import PointFusion
 from gradslam.structures.rgbdimages import RGBDImages
 
 from conceptgraph.utils.general_utils import to_scalar, measure_time
+from conceptgraph.utils.colmap import read_model
+
+# Mapping from scene_id to metadata CSV number for PADO dataset
+SCENE_ID_TO_NUMBER = {
+    "scene0": "420693",
+    "scene1": "436997",
+    "scene2": "466850",
+    "scene3": "468146",
+    "scene4": "421254",
+    "scene5": "421647",
+    "scene6": "422148",
+    "scene7": "421061",
+    "scene8": "421264",
+    "scene9": "421069",
+    "scene10": "422383",
+    "scene11": "422539",
+    "scene12": "423474",
+    "scene13": "422377",
+    "scene14": "468104",
+    "scene15": "423989",
+}
+
+def get_scene_number(scene_id: str) -> str:
+    """Convert scene_id (e.g., 'scene0') to metadata CSV number (e.g., '420693')"""
+    if scene_id in SCENE_ID_TO_NUMBER:
+        return SCENE_ID_TO_NUMBER[scene_id]
+    # If not found, return the original (might already be a number)
+    return scene_id
 
 
 def as_intrinsics_matrix(intrinsics):
@@ -42,6 +70,20 @@ def as_intrinsics_matrix(intrinsics):
     K[0, 2] = intrinsics[2]
     K[1, 2] = intrinsics[3]
     return K
+
+def as_intrinsics_matrix_rotated(intrinsics, ori_height):
+    """
+    Get matrix representation of intrinsics.
+    [self.fx, self.fy, self.cx, self.cy]
+
+    """
+    K = np.eye(3)
+    K[0, 0] = intrinsics[1]
+    K[1, 1] = intrinsics[0]
+    K[0, 2] = ori_height - intrinsics[3]
+    K[1, 2] = intrinsics[2]
+    return K
+
 
 def from_intrinsics_matrix(K: torch.Tensor) -> tuple[float, float, float, float]:
     '''
@@ -89,6 +131,11 @@ def readEXR_onlydepth(filename):
     Y = None if "Y" not in header["channels"] else channelData["Y"]
 
     return Y
+
+
+
+
+
 
 
 class GradSLAMDataset(torch.utils.data.Dataset):
@@ -162,6 +209,8 @@ class GradSLAMDataset(torch.utils.data.Dataset):
 
         self.color_paths, self.depth_paths, self.embedding_paths = self.get_filepaths()
         if len(self.color_paths) != len(self.depth_paths):
+            print(len(self.color_paths))
+            print(len(self.depth_paths))
             raise ValueError("Number of color and depth images must be the same.")
         if self.load_embeddings:
             if len(self.color_paths) != len(self.embedding_paths):
@@ -221,6 +270,8 @@ class GradSLAMDataset(torch.utils.data.Dataset):
             (self.desired_width, self.desired_height),
             interpolation=cv2.INTER_LINEAR,
         )
+        if self.camera_axis == 'Left':
+            color = cv2.rotate(color, cv2.ROTATE_90_CLOCKWISE)
         if self.normalize_color:
             color = datautils.normalize_image(color)
         if self.channels_first:
@@ -246,6 +297,8 @@ class GradSLAMDataset(torch.utils.data.Dataset):
             (self.desired_width, self.desired_height),
             interpolation=cv2.INTER_NEAREST,
         )
+        if self.camera_axis == 'Left':
+            depth = cv2.rotate(depth, cv2.ROTATE_90_CLOCKWISE)
         depth = np.expand_dims(depth, -1)
         if self.channels_first:
             depth = datautils.channels_first(depth)
@@ -289,6 +342,8 @@ class GradSLAMDataset(torch.utils.data.Dataset):
         raise NotImplementedError
 
     def __getitem__(self, index):
+        if not hasattr(self, 'camera_axis'):
+            self.camera_axis = 'Up'
         color_path = self.color_paths[index]
         depth_path = self.depth_paths[index]
         color = np.asarray(imageio.imread(color_path), dtype=float)
@@ -303,6 +358,12 @@ class GradSLAMDataset(torch.utils.data.Dataset):
             depth = np.load(depth_path)
         else:
             raise NotImplementedError
+        if self.camera_axis == 'Left':
+            K = as_intrinsics_matrix_rotated([self.fx, self.fy, self.cx, self.cy], self.desired_height)
+        elif self.camera_axis == 'Up':
+            K = as_intrinsics_matrix([self.fx, self.fy, self.cx, self.cy])
+        else:
+            K = as_intrinsics_matrix([self.fx, self.fy, self.cx, self.cy]) # for down
 
         K = as_intrinsics_matrix([self.fx, self.fy, self.cx, self.cy])
         K = torch.from_numpy(K)
@@ -313,9 +374,23 @@ class GradSLAMDataset(torch.utils.data.Dataset):
         depth = self._preprocess_depth(depth)
         depth = torch.from_numpy(depth)
 
-        K = datautils.scale_intrinsics(
-            K, self.height_downsample_ratio, self.width_downsample_ratio
-        )
+        # K = datautils.scale_intrinsics(
+        #     K, self.height_downsample_ratio, self.width_downsample_ratio
+        # )
+
+        if self.camera_axis == 'Left':
+            K = datautils.scale_intrinsics(
+                K, self.width_downsample_ratio, self.height_downsample_ratio
+            )
+        elif self.camera_axis == 'Up':
+            K = datautils.scale_intrinsics(
+                K, self.height_downsample_ratio, self.width_downsample_ratio
+            )
+        else: 
+             K = datautils.scale_intrinsics(
+                K, self.height_downsample_ratio, self.width_downsample_ratio
+            ) # for down
+
         intrinsics = torch.eye(4).to(K)
         intrinsics[:3, :3] = K
 
@@ -339,6 +414,574 @@ class GradSLAMDataset(torch.utils.data.Dataset):
             pose.to(self.device).type(self.dtype),
             # self.retained_inds[index].item(),
         )
+
+class FunGraph3DDataset(GradSLAMDataset):
+    def __init__(
+        self,
+        config_dict,
+        basedir,
+        sequence,
+        stride: Optional[int] = None,
+        start: Optional[int] = 0,
+        end: Optional[int] = -1,
+        desired_height: Optional[int] = 480,
+        desired_width: Optional[int] = 640,
+        load_embeddings: Optional[bool] = False,
+        embedding_dir: Optional[str] = "embeddings",
+        embedding_dim: Optional[int] = 512,
+        **kwargs,
+    ):
+        self.input_folder = os.path.join(basedir, sequence)
+        super().__init__(
+            config_dict,
+            stride=stride,
+            start=start,
+            end=end,
+            desired_height=desired_height,
+            desired_width=desired_width,
+            load_embeddings=load_embeddings,
+            embedding_dir=embedding_dir,
+            embedding_dim=embedding_dim,
+            **kwargs,
+        )
+
+    def get_filepaths(self):
+        color_paths = natsorted(glob.glob(f"{self.input_folder}/rgb/*.jpg"))
+        depth_paths = natsorted(glob.glob(f"{self.input_folder}/depth/*.png"))
+        embedding_paths = None
+        if self.load_embeddings:
+            embedding_paths = natsorted(
+                glob.glob(f"{self.input_folder}/{self.embedding_dir}/*.pt")
+            )
+        return color_paths, depth_paths, embedding_paths
+
+    def load_poses(self):
+        poses = []
+        cameras, images = read_model(self.input_folder, ".txt")
+        for color_p in self.color_paths:
+            for image_id, image in images.items():
+                image_name = image.name.split('/')[-1]
+                if image_name in color_p:
+                    world_to_camera = image.world_to_camera
+                    c2w = np.linalg.inv(world_to_camera)
+                    c2w = torch.from_numpy(c2w).float()
+                    poses.append(c2w)
+                    break
+        return poses
+    
+
+class SceneFun3DDataset(GradSLAMDataset):
+    def __init__(
+        self,
+        config_dict,
+        basedir,
+        sequence,
+        stride: Optional[int] = None,
+        start: Optional[int] = 0,
+        end: Optional[int] = -1,
+        desired_height: Optional[int] = 480,
+        desired_width: Optional[int] = 640,
+        load_embeddings: Optional[bool] = False,
+        embedding_dir: Optional[str] = "embeddings",
+        embedding_dim: Optional[int] = 512,
+        **kwargs,
+    ):
+        self.input_folder = os.path.join(basedir, sequence)
+        self.pose_path = os.path.join(self.input_folder, "lowres_wide.traj")
+        # self.pose_path = os.path.join(self.input_folder, "hires_poses.traj")
+        meta_file = os.path.join(basedir, 'metadata.csv')
+        with open(meta_file, encoding = 'utf-8') as f:
+            meta_csv = np.loadtxt(f,str,delimiter = ",")
+        for line in meta_csv:
+            if sequence.split('/')[0] in line and sequence.split('/')[1] in line:
+                self.camera_axis = line[2]
+        # self.camera_axis = 'Up'
+        super().__init__(
+            config_dict,
+            stride=stride,
+            start=start,
+            end=end,
+            desired_height=desired_height,
+            desired_width=desired_width,
+            load_embeddings=load_embeddings,
+            embedding_dir=embedding_dir,
+            embedding_dim=embedding_dim,
+            **kwargs,
+        )
+
+    def get_filepaths(self):
+        color_paths = natsorted(glob.glob(f"{self.input_folder}/wide/*.png"))
+        depth_paths = natsorted(glob.glob(f"{self.input_folder}/highres_depth/*.png"))
+        embedding_paths = None
+        if self.load_embeddings:
+            embedding_paths = natsorted(
+                glob.glob(f"{self.input_folder}/{self.embedding_dir}/*.pt")
+            )
+        return color_paths, depth_paths, embedding_paths
+
+    def load_poses(self):
+        poses = []
+        poses_from_traj = {}
+        with open(self.pose_path, "r") as f:
+            lines = f.readlines()
+        for line in lines:
+            traj_timestamp = line.split(" ")[0]
+            poses_from_traj[f"{round(float(traj_timestamp), 3):.3f}"] = np.array(self.TrajStringToMatrix(line)[1].tolist())
+        color_paths, depth_paths, embedding_paths = self.get_filepaths()
+        new_color_paths, new_depth_paths, new_embedding_paths = [], [], []
+        for idx, color_file in enumerate(color_paths):
+            frame_id = os.path.basename(color_file).split(".png")[0].split("_")[1]
+            c2w = self.get_nearest_pose(frame_id, poses_from_traj, use_interpolation=True, time_distance_threshold=0.2)
+            # rotated
+            R_z_90 = np.array([
+                [0,  1, 0],
+                [-1, 0, 0],
+                [0,  0, 1],
+            ])
+
+            # 180도 회전 (90도 두 번)
+            R_z_180 = R_z_90 @ R_z_90
+
+            # -90도 회전은 90도 회전의 transpose(역행렬)로 쓸 수 있음
+            R_z_m90 = R_z_90.T
+            if c2w is not None:
+                R_c2w = c2w[:3, :3]
+                t_c2w = c2w[:3, 3]
+                if self.camera_axis == 'Left':
+                    R_c2w_prime = np.dot(R_c2w, R_z_90)
+                elif self.camera_axis == 'Up':
+                    R_c2w_prime = R_c2w
+                # elif self.camera_axis == 'Right':
+                #     # 하늘이 이미지의 오른쪽에 있음 → -90도 회전해서 위로 오게
+                #     R_c2w_prime = R_c2w @ R_z_m90   # = R_c2w @ R_z_90.T
+
+                # elif self.camera_axis == 'Down':
+                #     # 하늘이 이미지의 아래쪽에 있음 → 180도 회전해서 위로 오게
+                #     R_c2w_prime = R_c2w @ R_z_180
+                adjusted_camera_pose = np.eye(4)
+                adjusted_camera_pose[:3, :3] = R_c2w_prime
+                adjusted_camera_pose[:3, 3] = t_c2w
+                c2w = torch.from_numpy(adjusted_camera_pose).float()
+                poses.append(c2w)
+                new_color_paths.append(color_file)
+                new_depth_paths.append(depth_paths[idx])
+                if embedding_paths is not None:
+                    new_embedding_paths.append(embedding_paths[idx])
+        self.color_paths, self.depth_paths, self.embedding_paths = new_color_paths, new_depth_paths, new_embedding_paths
+        return poses
+    
+    def get_nearest_pose(self, 
+                         desired_timestamp,
+                         poses_from_traj, 
+                         time_distance_threshold = np.inf,
+                         use_interpolation = False,
+                         interpolation_method = 'split',
+                         frame_distance_threshold = np.inf):
+        """
+        Get the nearest pose to a desired timestamp from a dictionary of poses.
+
+        Args:
+            desired_timestamp (float): The timestamp of the desired pose.
+            poses_from_traj (dict): A dictionary where keys are timestamps and values are 4x4 transformation matrices representing poses.
+            time_distance_threshold (float, optional): The maximum allowable time difference between the desired timestamp and the nearest pose timestamp. Defaults to np.inf.
+            use_interpolation (bool, optional): Whether to use interpolation to find the nearest pose. Defaults to False.
+            interpolation_method (str, optional): Supports two options, "split" or "geodesic_path". Defaults to "split".
+
+                - "split": performs rigid body motion interpolation in SO(3) x R^3
+                - "geodesic_path": performs rigid body motion interpolation in SE(3)
+            frame_distance_threshold (float, optional): The maximum allowable distance in terms of frame difference between the desired timestamp and the nearest pose timestamp. Defaults to np.inf.
+
+        Returns:
+            (Union[numpy.ndarray, None]): The nearest pose as a 4x4 transformation matrix if found within the specified thresholds, else None.
+
+        Raises:
+            ValueError: If an unsupported interpolation method is specified.
+
+        Note:
+            If `use_interpolation` is True, the function will perform rigid body motion interpolation between two nearest poses to estimate the desired pose. 
+            The thresholds `time_distance_threshold` and `frame_distance_threshold` are used to control how tolerant the function is towards deviations in time and frame distance.
+        """
+
+        max_pose_timestamp = max(float(key) for key in poses_from_traj.keys())
+        min_pose_timestamp = min(float(key) for key in poses_from_traj.keys()) 
+
+        if float(desired_timestamp) < min_pose_timestamp or \
+            float(desired_timestamp) > max_pose_timestamp:
+            print('Out')
+            return None
+
+        if desired_timestamp in poses_from_traj.keys():
+            H = poses_from_traj[desired_timestamp]
+        else:
+            if use_interpolation:
+                greater_closest_timestamp = min(
+                    [x for x in poses_from_traj.keys() if float(x) > float(desired_timestamp) ], 
+                    key=lambda x: abs(float(x) - float(desired_timestamp))
+                )
+                smaller_closest_timestamp = min(
+                    [x for x in poses_from_traj.keys() if float(x) < float(desired_timestamp) ], 
+                    key=lambda x: abs(float(x) - float(desired_timestamp))
+                )
+
+                if abs(float(greater_closest_timestamp) - float(desired_timestamp)) > time_distance_threshold or \
+                    abs(float(smaller_closest_timestamp) - float(desired_timestamp)) > time_distance_threshold:
+                    print("Skipping frame.")
+                    return None
+                
+                H0 = poses_from_traj[smaller_closest_timestamp]
+                H1 = poses_from_traj[greater_closest_timestamp]
+                H0_t = trans(H0)
+                H1_t = trans(H1)
+
+                if np.linalg.norm(H0_t - H1_t) > frame_distance_threshold:
+                    print("Skipping frame.")
+                    return None
+
+                if interpolation_method == "split":
+                    H = rigid_interp_split(
+                        float(desired_timestamp), 
+                        poses_from_traj[smaller_closest_timestamp], 
+                        float(smaller_closest_timestamp), 
+                        poses_from_traj[greater_closest_timestamp], 
+                        float(greater_closest_timestamp)
+                    )
+                elif interpolation_method == "geodesic_path":
+                    H = rigid_interp_geodesic(
+                        float(desired_timestamp), 
+                        poses_from_traj[smaller_closest_timestamp], 
+                        float(smaller_closest_timestamp), 
+                        poses_from_traj[greater_closest_timestamp], 
+                        float(greater_closest_timestamp)
+                    )
+                else:
+                    raise ValueError(f"Unknown interpolation method {interpolation_method}")
+
+            else:
+                closest_timestamp = min(
+                    poses_from_traj.keys(), 
+                    key=lambda x: abs(float(x) - float(desired_timestamp))
+                )
+
+                if abs(float(closest_timestamp) - float(desired_timestamp)) > time_distance_threshold:
+                    print("Skipping frame.")
+                    return None
+
+                H = poses_from_traj[closest_timestamp]
+
+        desired_pose = H
+
+        assert desired_pose.shape == (4, 4)
+
+        return desired_pose
+    
+    def TrajStringToMatrix(self, traj_str):
+        """ 
+        Converts a line from the camera trajectory file into translation and rotation matrices
+
+        Args:
+            traj_str (str): A space-delimited file where each line represents a camera pose at a particular timestamp. The file has seven columns:
+
+                - Column 1: timestamp
+                - Columns 2-4: rotation (axis-angle representation in radians)
+                - Columns 5-7: translation (usually in meters)
+
+        Returns:
+            (tuple): Tuple containing:
+
+                - ts (str): Timestamp.
+                - Rt (numpy.ndarray): Transformation matrix representing rotation and translation.
+
+        Raises:
+            AssertionError: If the input string does not have exactly seven columns.
+        """
+
+        tokens = traj_str.split()
+        assert len(tokens) == 7
+        ts = tokens[0]
+
+        # Rotation in angle axis
+        angle_axis = [float(tokens[1]), float(tokens[2]), float(tokens[3])]
+        r_w_to_p = convert_angle_axis_to_matrix3(np.asarray(angle_axis))
+
+        # Translation
+        t_w_to_p = np.asarray([float(tokens[4]), float(tokens[5]), float(tokens[6])])
+        extrinsics = np.eye(4, 4)
+        extrinsics[:3, :3] = r_w_to_p
+        extrinsics[:3, -1] = t_w_to_p
+        Rt = np.linalg.inv(extrinsics)
+
+        return (ts, Rt)
+
+    def read_embedding_from_file(self, embedding_file_path):
+        embedding = torch.load(embedding_file_path)
+        return embedding.permute(0, 2, 3, 1)  # (1, H, W, embedding_dim)
+
+
+class PADODataset(GradSLAMDataset):
+    def __init__(
+        self,
+        config_dict,
+        basedir,
+        sequence,
+        stride: Optional[int] = None,
+        start: Optional[int] = 0,
+        end: Optional[int] = -1,
+        desired_height: Optional[int] = 480,
+        desired_width: Optional[int] = 640,
+        load_embeddings: Optional[bool] = False,
+        embedding_dir: Optional[str] = "embeddings",
+        embedding_dim: Optional[int] = 512,
+        **kwargs,
+    ):
+        self.input_folder = os.path.join(basedir, sequence)
+        # self.pose_path = os.path.join(self.input_folder, "lowres_wide.traj")
+        self.pose_path = os.path.join(self.input_folder, "hires_poses.traj")
+        meta_file = os.path.join(basedir, 'metadata.csv')
+        with open(meta_file, encoding = 'utf-8') as f:
+            meta_csv = np.loadtxt(f,str,delimiter = ",")
+
+        # Convert scene_id to metadata number for lookup
+        sequence_parts = sequence.split('/')
+        scene_number = get_scene_number(sequence_parts[0])
+        video_id = sequence_parts[1] if len(sequence_parts) > 1 else ""
+
+        self.camera_axis = None  # Default value
+        for line in meta_csv:
+            if scene_number in line and video_id in line:
+                self.camera_axis = line[2]
+                break
+
+        # Fallback if not found
+        if self.camera_axis is None:
+            print(f"[WARN] camera_axis not found for sequence={sequence} (scene_number={scene_number}), defaulting to 'Up'")
+            self.camera_axis = 'Up'
+        super().__init__(
+            config_dict,
+            stride=stride,
+            start=start,
+            end=end,
+            desired_height=desired_height,
+            desired_width=desired_width,
+            load_embeddings=load_embeddings,
+            embedding_dir=embedding_dir,
+            embedding_dim=embedding_dim,
+            **kwargs,
+        )
+
+    def get_filepaths(self):
+        color_paths = natsorted(glob.glob(f"{self.input_folder}/hires_wide/*.jpg"))
+        depth_paths = natsorted(glob.glob(f"{self.input_folder}/hires_depth/*.png"))
+        # print(f'self_input folder is ',self.input_folder)
+        # print(f'color_paths is ',color_paths)
+        # print(f'depth_paths is ',depth_paths)
+        embedding_paths = None
+        if self.load_embeddings:
+            embedding_paths = natsorted(
+                glob.glob(f"{self.input_folder}/{self.embedding_dir}/*.pt")
+            )
+        return color_paths, depth_paths, embedding_paths
+
+    def load_poses(self):
+        poses = []
+        poses_from_traj = {}
+        with open(self.pose_path, "r") as f:
+            lines = f.readlines()
+        for line in lines:
+            traj_timestamp = line.split(" ")[0]
+            poses_from_traj[f"{round(float(traj_timestamp), 3):.3f}"] = np.array(self.TrajStringToMatrix(line)[1].tolist())
+        color_paths, depth_paths, embedding_paths = self.get_filepaths()
+        new_color_paths, new_depth_paths, new_embedding_paths = [], [], []
+        for idx, color_file in enumerate(color_paths):
+            frame_id = os.path.basename(color_file).split(".jpg")[0].split("_")[1]
+            c2w = self.get_nearest_pose(frame_id, poses_from_traj, use_interpolation=True, time_distance_threshold=0.2)
+            # rotated
+            R_z_90 = np.array([
+                [0,  1, 0],
+                [-1, 0, 0],
+                [0,  0, 1],
+            ])
+            if c2w is not None:
+                R_c2w = c2w[:3, :3]
+                t_c2w = c2w[:3, 3]
+                # if self.camera_axis == 'Left':
+                #     R_c2w_prime = np.dot(R_c2w, R_z_90)
+                # elif self.camera_axis == 'Up':
+                #     R_c2w_prime = R_c2w
+                # else:
+                #     print(self.camera_axis)
+                 # 180도 회전 (90도 두 번)
+                R_z_180 = R_z_90 @ R_z_90
+
+                # -90도 회전은 90도 회전의 transpose(역행렬)로 쓸 수 있음
+                R_z_m90 = R_z_90.T
+                if self.camera_axis == 'Left':
+                    R_c2w_prime = np.dot(R_c2w, R_z_90)
+                elif self.camera_axis == 'Up':
+                    R_c2w_prime = R_c2w
+                elif self.camera_axis == 'Right':
+                    # 하늘이 이미지의 오른쪽에 있음 → -90도 회전해서 위로 오게
+                    R_c2w_prime = R_c2w @ R_z_m90   # = R_c2w @ R_z_90.T
+                elif self.camera_axis == 'Down':
+                    # 하늘이 이미지의 아래쪽에 있음 → 180도 회전해서 위로 오게
+                    R_c2w_prime = R_c2w @ R_z_180
+                adjusted_camera_pose = np.eye(4)
+                adjusted_camera_pose[:3, :3] = R_c2w_prime
+                adjusted_camera_pose[:3, 3] = t_c2w
+                c2w = torch.from_numpy(adjusted_camera_pose).float()
+                poses.append(c2w)
+                new_color_paths.append(color_file)
+                new_depth_paths.append(depth_paths[idx])
+                if embedding_paths is not None:
+                    new_embedding_paths.append(embedding_paths[idx])
+        self.color_paths, self.depth_paths, self.embedding_paths = new_color_paths, new_depth_paths, new_embedding_paths
+        return poses
+    
+    def get_nearest_pose(self, 
+                         desired_timestamp,
+                         poses_from_traj, 
+                         time_distance_threshold = np.inf,
+                         use_interpolation = False,
+                         interpolation_method = 'split',
+                         frame_distance_threshold = np.inf):
+        """
+        Get the nearest pose to a desired timestamp from a dictionary of poses.
+
+        Args:
+            desired_timestamp (float): The timestamp of the desired pose.
+            poses_from_traj (dict): A dictionary where keys are timestamps and values are 4x4 transformation matrices representing poses.
+            time_distance_threshold (float, optional): The maximum allowable time difference between the desired timestamp and the nearest pose timestamp. Defaults to np.inf.
+            use_interpolation (bool, optional): Whether to use interpolation to find the nearest pose. Defaults to False.
+            interpolation_method (str, optional): Supports two options, "split" or "geodesic_path". Defaults to "split".
+
+                - "split": performs rigid body motion interpolation in SO(3) x R^3
+                - "geodesic_path": performs rigid body motion interpolation in SE(3)
+            frame_distance_threshold (float, optional): The maximum allowable distance in terms of frame difference between the desired timestamp and the nearest pose timestamp. Defaults to np.inf.
+
+        Returns:
+            (Union[numpy.ndarray, None]): The nearest pose as a 4x4 transformation matrix if found within the specified thresholds, else None.
+
+        Raises:
+            ValueError: If an unsupported interpolation method is specified.
+
+        Note:
+            If `use_interpolation` is True, the function will perform rigid body motion interpolation between two nearest poses to estimate the desired pose. 
+            The thresholds `time_distance_threshold` and `frame_distance_threshold` are used to control how tolerant the function is towards deviations in time and frame distance.
+        """
+
+        max_pose_timestamp = max(float(key) for key in poses_from_traj.keys())
+        min_pose_timestamp = min(float(key) for key in poses_from_traj.keys()) 
+
+        if float(desired_timestamp) < min_pose_timestamp or \
+            float(desired_timestamp) > max_pose_timestamp:
+            print('Out')
+            return None
+
+        if desired_timestamp in poses_from_traj.keys():
+            H = poses_from_traj[desired_timestamp]
+        else:
+            if use_interpolation:
+                greater_closest_timestamp = min(
+                    [x for x in poses_from_traj.keys() if float(x) > float(desired_timestamp) ], 
+                    key=lambda x: abs(float(x) - float(desired_timestamp))
+                )
+                smaller_closest_timestamp = min(
+                    [x for x in poses_from_traj.keys() if float(x) < float(desired_timestamp) ], 
+                    key=lambda x: abs(float(x) - float(desired_timestamp))
+                )
+
+                if abs(float(greater_closest_timestamp) - float(desired_timestamp)) > time_distance_threshold or \
+                    abs(float(smaller_closest_timestamp) - float(desired_timestamp)) > time_distance_threshold:
+                    print("Skipping frame.")
+                    return None
+                
+                H0 = poses_from_traj[smaller_closest_timestamp]
+                H1 = poses_from_traj[greater_closest_timestamp]
+                H0_t = trans(H0)
+                H1_t = trans(H1)
+
+                if np.linalg.norm(H0_t - H1_t) > frame_distance_threshold:
+                    print("Skipping frame.")
+                    return None
+
+                if interpolation_method == "split":
+                    H = rigid_interp_split(
+                        float(desired_timestamp), 
+                        poses_from_traj[smaller_closest_timestamp], 
+                        float(smaller_closest_timestamp), 
+                        poses_from_traj[greater_closest_timestamp], 
+                        float(greater_closest_timestamp)
+                    )
+                elif interpolation_method == "geodesic_path":
+                    H = rigid_interp_geodesic(
+                        float(desired_timestamp), 
+                        poses_from_traj[smaller_closest_timestamp], 
+                        float(smaller_closest_timestamp), 
+                        poses_from_traj[greater_closest_timestamp], 
+                        float(greater_closest_timestamp)
+                    )
+                else:
+                    raise ValueError(f"Unknown interpolation method {interpolation_method}")
+
+            else:
+                closest_timestamp = min(
+                    poses_from_traj.keys(), 
+                    key=lambda x: abs(float(x) - float(desired_timestamp))
+                )
+
+                if abs(float(closest_timestamp) - float(desired_timestamp)) > time_distance_threshold:
+                    print("Skipping frame.")
+                    return None
+
+                H = poses_from_traj[closest_timestamp]
+
+        desired_pose = H
+
+        assert desired_pose.shape == (4, 4)
+
+        return desired_pose
+    
+    def TrajStringToMatrix(self, traj_str):
+        """ 
+        Converts a line from the camera trajectory file into translation and rotation matrices
+
+        Args:
+            traj_str (str): A space-delimited file where each line represents a camera pose at a particular timestamp. The file has seven columns:
+
+                - Column 1: timestamp
+                - Columns 2-4: rotation (axis-angle representation in radians)
+                - Columns 5-7: translation (usually in meters)
+
+        Returns:
+            (tuple): Tuple containing:
+
+                - ts (str): Timestamp.
+                - Rt (numpy.ndarray): Transformation matrix representing rotation and translation.
+
+        Raises:
+            AssertionError: If the input string does not have exactly seven columns.
+        """
+
+        tokens = traj_str.split()
+        assert len(tokens) == 7
+        ts = tokens[0]
+
+        # Rotation in angle axis
+        angle_axis = [float(tokens[1]), float(tokens[2]), float(tokens[3])]
+        r_w_to_p = convert_angle_axis_to_matrix3(np.asarray(angle_axis))
+
+        # Translation
+        t_w_to_p = np.asarray([float(tokens[4]), float(tokens[5]), float(tokens[6])])
+        extrinsics = np.eye(4, 4)
+        extrinsics[:3, :3] = r_w_to_p
+        extrinsics[:3, -1] = t_w_to_p
+        Rt = np.linalg.inv(extrinsics)
+
+        return (ts, Rt)
+
+    def read_embedding_from_file(self, embedding_file_path):
+        embedding = torch.load(embedding_file_path)
+        return embedding.permute(0, 2, 3, 1)  # (1, H, W, embedding_dim)
+
 
 
 class ICLDataset(GradSLAMDataset):
@@ -502,7 +1145,8 @@ class ScannetDataset(GradSLAMDataset):
         self.pose_path = None
 
         # Load the intrinsic matrix from the file in each scene
-        scene_intrinsic_path = os.path.join(self.input_folder, "intrinsic", "intrinsic_color.txt")
+        # scene_intrinsic_path = os.path.join(self.input_folder, "intrinsic", "intrinsic_color.txt")
+        scene_intrinsic_path = os.path.join(basedir, "intrinsics.txt")
         scene_intrinsic = np.loadtxt(scene_intrinsic_path)
         config_dict['camera_params']['fx'] = scene_intrinsic[0, 0]
         config_dict['camera_params']['fy'] = scene_intrinsic[1, 1]
@@ -544,6 +1188,73 @@ class ScannetDataset(GradSLAMDataset):
         print(embedding_file_path)
         embedding = torch.load(embedding_file_path, map_location="cpu")
         return embedding.permute(0, 2, 3, 1)  # (1, H, W, embedding_dim)
+
+
+class RSCAN_Dataset(GradSLAMDataset):
+    def __init__(
+        self,
+        config_dict,
+        basedir,
+        sequence,
+        stride: Optional[int] = None,
+        start: Optional[int] = 0,
+        end: Optional[int] = -1,
+        desired_height: Optional[int] = 540,
+        desired_width: Optional[int] = 960,
+        load_embeddings: Optional[bool] = False,
+        embedding_dir: Optional[str] = "embeddings",
+        embedding_dim: Optional[int] = 512,
+        **kwargs,
+    ):
+        self.input_folder = os.path.join(basedir, sequence)
+        self.pose_path = None
+
+        # Load the intrinsic matrix from the file in each scene
+        # scene_intrinsic_path = os.path.join(self.input_folder, "intrinsic", "intrinsic_color.txt")
+        scene_intrinsic_path = os.path.join(self.input_folder, "intrinsics.txt")
+        scene_intrinsic = np.loadtxt(scene_intrinsic_path)
+        # print(config_dict)
+        config_dict['camera_params']['fx'] = scene_intrinsic[0, 0]
+        config_dict['camera_params']['fy'] = scene_intrinsic[1, 1]
+        config_dict['camera_params']['cx'] = scene_intrinsic[0, 2]
+        config_dict['camera_params']['cy'] = scene_intrinsic[1, 2]
+        
+        super().__init__(
+            config_dict,
+            stride=stride,
+            start=start,
+            end=end,
+            desired_height=desired_height,
+            desired_width=desired_width,
+            load_embeddings=load_embeddings,
+            embedding_dir=embedding_dir,
+            embedding_dim=embedding_dim,
+            **kwargs,
+        )
+
+    def get_filepaths(self):
+        color_paths = natsorted(glob.glob(f"{self.input_folder}/sequence/*.rendered.color.jpg"))
+        depth_paths = natsorted(glob.glob(f"{self.input_folder}/sequence/*.depth.png"))
+        embedding_paths = None
+        if self.load_embeddings:
+            embedding_paths = natsorted(
+                glob.glob(f"{self.input_folder}/{self.embedding_dir}/*.pt")
+            )
+        return color_paths, depth_paths, embedding_paths
+
+    def load_poses(self):
+        poses = []
+        posefiles = natsorted(glob.glob(f"{self.input_folder}/sequence/*.pose.txt"))
+        for posefile in posefiles:
+            _pose = torch.from_numpy(np.loadtxt(posefile))
+            poses.append(_pose)
+        return poses
+
+    def read_embedding_from_file(self, embedding_file_path):
+        print(embedding_file_path)
+        embedding = torch.load(embedding_file_path, map_location="cpu")
+        return embedding.permute(0, 2, 3, 1)  # (1, H, W, embedding_dim)
+
 
 
 class Ai2thorDataset(GradSLAMDataset):
@@ -1164,6 +1875,243 @@ def common_dataset_to_batch(dataset):
         embeddings = embeddings.float()
     return colors, depths, intrinsics, poses, embeddings
 
+def convert_angle_axis_to_matrix3(angle_axis):
+    """
+    Converts a rotation from angle-axis representation to a 3x3 rotation matrix.
+
+    Args:
+        angle_axis (numpy.ndarray): A 3-element array representing the rotation in angle-axis form [angle, axis_x, axis_y, axis_z].
+
+    Returns:
+        (numpy.ndarray): A 3x3 rotation matrix representing the same rotation as the input angle-axis.
+
+    """
+    matrix, jacobian = cv2.Rodrigues(angle_axis)
+    return matrix
+
+
+def rot(H):
+    return H[:3, :3]
+
+
+def trans(H):
+    return H[:3, 3]
+
+
+def inverse(H):
+    H_inv = np.eye(4)
+    H_inv[0:3, 0:3] = rot(H).T
+    H_inv[0:3, 3] = -rot(H).T @ trans(H)
+
+    return H_inv
+
+
+def rigid_interp_geodesic(t, H0, t0, H1, t1):
+    """
+    Performs rigid body motion interpolation in SE(3). See https://www.geometrictools.com/Documentation/InterpolationRigidMotions.pdf.
+
+    Args:
+        t (float): desired timestep
+        H0 (numpy.ndarray): homogenous matrix (4x4) describing the motion in timestep t0
+        t0 (float): timestep corresponding to H0
+        H1 (numpy.ndarray): homogenous matrix (4x4) describing the motion in timestep t1
+        t1 (float): timestep corresponding to H1
+
+    Returns:
+        (numpy.ndarray): homogenous matrix (4x4) describing the motion in timestep t  
+    
+    """
+
+    # map t in the interval [0, 1]
+    slope = (1.0 - 0.0) / (t1 - t0)
+    t_ = 0.0 + slope * (t - t0)
+
+    return GeodesicPath(t_, H0, H1)
+
+
+def rigid_interp_split(t, H0, t0, H1, t1):
+    """
+    Performs rigid body motion interpolation in SO(3) x R^3. See https://www.adrian-haarbach.de/interpolation-methods/doc/haarbach2018survey.pdf.
+
+    Args:
+        t (float): desired timestep
+        H0 (numpy.ndarray): homogenous matrix (4x4) describing the motion in timestep t0
+        t0 (float): timestep corresponding to H0
+        H1 (numpy.ndarray): homogenous matrix (4x4) describing the motion in timestep t1
+        t1 (float): timestep corresponding to H1
+
+    Returns:
+        (numpy.ndarray): homogenous matrix (4x4) describing the motion in timestep t  
+    
+    """
+
+    # map t in the interval [0, 1]
+    slope = (1.0 - 0.0) / (t1 - t0)
+    t_ = 0.0 + slope * (t - t0)
+
+    H0_R = H0[0:3, 0:3]
+    H0_T = H0[0:3, 3]
+    H0_new = np.eye(4)
+    H0_new[0:3, 0:3] = H0_R
+
+    H1_R = H1[0:3, 0:3]
+    H1_T = H1[0:3, 3]
+    H1_new = np.eye(4)
+    H1_new[0:3, 0:3] = H1_R
+
+    interpH = np.eye(4)
+
+    interpH[0:3, 0:3] = GeodesicPath(t_, H0_new, H1_new)[0:3, 0:3]
+
+    interpH[0:3, 3] = H0_T + t_ * (H1_T - H0_T)
+
+    return interpH
+
+
+def GeodesicPath(t, H0, H1):
+
+    # If you plan on calling Geodesic Path for the same H0 and H1 but for multiple
+    # t−values, the following terms can be precomputed and cached for use by the
+    # last block of code
+    H = H1 @ InverseRigid(H0)
+    H_R = H[0:3, 0:3]
+    H_T = H[0:3, 3]
+
+    S = Log(H_R)
+
+    s0 = S[2, 1]
+    s1 = S[0, 2]
+    s2 = S[1, 0]
+    theta = np.sqrt(s0*s0 + s1*s1 + s2*s2)
+    invV1 = computeInverseV1(theta, S)
+    U = invV1 @ H_T
+    #### until here the terms can be precomputed for multiple t-values
+
+    interpR = Exp(t, theta, S)
+    interpTTimesV = computeTTimesV(t, theta, S)
+
+    interpH = np.eye(4)
+    H0_R = H0[0:3, 0:3]
+    H0_T = H0[0:3, 3]
+    interpH[0:3, 0:3] = interpR @ H0_R
+    interpH[0:3, 3] = interpR @ H0_T + interpTTimesV @ U
+
+    return interpH
+
+
+def InverseRigid(H):
+    H_R = H[0:3, 0:3]
+    H_T = H[0:3, 3]
+
+    invH = np.eye(4)
+    invH[0:3, 0:3] = H_R.T
+    invH[0:3, 3] = -H_R.T @ H_T
+
+    return invH
+
+
+def Exp(t, theta, S):
+    angle = t * theta
+    thetaSqr = theta * theta
+
+    if theta > 0:
+        return np.eye(3) + (np.sin(angle) / theta) * S + ((1 - np.cos(angle)) / thetaSqr) * S @ S
+    else:
+        return np.eye(3)
+
+
+def Log(R):
+    S = np.array((3, 3))
+
+    arg = 0.5 * (R[0, 0] + R[1, 1] + R[2, 2] - 1) # in [-1,1]
+
+    if arg > -1:
+        if arg < 1:
+            # 0 < angle < pi
+            angle = np.arccos(arg)
+            sinAngle = np.sin(angle)
+
+            c = 0.5 * angle / sinAngle
+            S = c * (R - R.T)
+        else: # arg = 1, angle = 0
+            # R is the identity matrix and S is the zero matrix
+            S = np.zeros((3, 3))
+    else: # arg = -1, angle = pi
+        # Knowing R+I is symmetric and wanting to avoid bias, we use
+        # ( R(i,j) + R(j,i) ) / 2 for the off−diagonal entries rather than R(i,j)
+        s = np.zeros((3, 1))
+        if R[0, 0] >= R[1, 1]:
+            if R[0, 0] >= R[2, 2]:
+                # r00 is the maximum diagonal term
+                s[0] = R[0, 0] + 1
+                s[1] = 0.5 * (R[0, 1] + R[1, 0])
+                s[2] = 0.5 * (R[0, 2] + R[2, 0])
+            else:
+                # r22 is the maximum diagonal term
+                s[0] = 0.5 * (R[2, 0] + R[0, 2])
+                s[1] = 0.5 * (R[2, 1] + R[1, 2])
+                s[2] = R[2, 2] + 1
+        else:
+            if R[1, 1] >= R[2, 2]:
+                # r11 is the maximum diagonal term
+                s[0] = 0.5 * (R[1, 0] + R[0, 1])
+                s[1] = R[1, 1] + 1
+                s[2] = 0.5 * (R[1, 2] + R[2, 1])
+
+            else:
+                # r22 is the maximum diagonal term
+                s[0] = 0.5 * (R[2, 0] + R[0, 2])
+                s[1] = 0.5 * (R[2, 1] + R[1, 2])
+                s[2] = R[2, 2] + 1
+
+        length = np.sqrt(s[0]*s[0] + s[1]*s[1] + s[2]*s[2])
+
+        if length > 0:
+            adjust = np.pi * np.sqrt(0.5) / length
+            s = adjust * s
+
+        else:
+            s = np.zeros((3, 1))
+
+
+        S[0, 0] = 0.0
+        S[0, 1] = -s[2]
+        s[0, 2] = s[1]
+        S[1, 0] = s[2]
+        S[1, 1] = 0.0
+        S[1, 2] = -s[0]
+        S[2, 0] = -s[1]
+        S[2, 1] = s[0]
+        S[2, 2] = 0.0
+
+    assert S.shape == (3, 3)
+    return S
+
+
+def computeTTimesV(t, theta, S):
+    if theta > 0:
+        angle = t * theta
+        thetaSqr = theta * theta 
+        thetaCub = theta * thetaSqr
+
+        c0 = (1 - np.cos(angle)) / thetaSqr
+        c1 = (angle - np.sin(angle)) / thetaCub
+
+        return t * np.eye(3) + c0 * S + c1 * S @ S
+    else:
+        return t * np.eye(3)
+
+
+def computeInverseV1(theta, S):
+    if theta > 0:
+        thetaSqr = theta * theta
+        c = (1 - (theta * np.sin(theta)) / (2 * (1 - np.cos(theta)))) / thetaSqr
+
+        return np.eye(3) - 0.5 * S + c * S @ S
+    else:
+        return np.eye(3)
+
+
 @measure_time
 def get_dataset(dataconfig, basedir, sequence, **kwargs):
     config_dict = load_dataset_config(dataconfig)
@@ -1171,10 +2119,18 @@ def get_dataset(dataconfig, basedir, sequence, **kwargs):
         return ICLDataset(config_dict, basedir, sequence, **kwargs)
     elif config_dict["dataset_name"].lower() in ["replica"]:
         return ReplicaDataset(config_dict, basedir, sequence, **kwargs)
+    elif config_dict['dataset_name'].lower() in ['scenefun3d']:
+        return SceneFun3DDataset(config_dict, basedir, sequence, **kwargs)
+    elif config_dict['dataset_name'].lower() in ['fungraph3d']:
+        return FunGraph3DDataset(config_dict, basedir, sequence, **kwargs)
+    elif config_dict['dataset_name'].lower() in ['pado']:
+        return PADODataset(config_dict, basedir, sequence, **kwargs)
     elif config_dict["dataset_name"].lower() in ["azure", "azurekinect"]:
         return AzureKinectDataset(config_dict, basedir, sequence, **kwargs)
     elif config_dict["dataset_name"].lower() in ["scannet"]:
         return ScannetDataset(config_dict, basedir, sequence, **kwargs)
+    elif config_dict["dataset_name"].lower() in ["3rscan"]:
+        return RSCAN_Dataset(config_dict, basedir, sequence, **kwargs)
     elif config_dict["dataset_name"].lower() in ["ai2thor"]:
         return Ai2thorDataset(config_dict, basedir, sequence, **kwargs)
     elif config_dict["dataset_name"].lower() in ["record3d"]:
